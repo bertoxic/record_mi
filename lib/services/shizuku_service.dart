@@ -121,7 +121,12 @@ class ShizukuService {
   Future<bool> initShizuku() async {
     try {
       final res = await _channel.invokeMethod('initShizuku');
-      await checkStatus();
+      // Wait up to 3 seconds for asynchronous binding to complete
+      for (int i = 0; i < 7; i++) {
+        await Future.delayed(const Duration(milliseconds: 400));
+        final bound = await checkStatus();
+        if (bound) return true;
+      }
       return res == true;
     } catch (e) {
       debugPrint("ShizukuService initShizuku error: $e");
@@ -151,7 +156,11 @@ class ShizukuService {
   Future<bool> requestPermission() async {
     try {
       final res = await _channel.invokeMethod('requestPermission');
-      await checkStatus();
+      for (int i = 0; i < 7; i++) {
+        await Future.delayed(const Duration(milliseconds: 400));
+        final bound = await checkStatus();
+        if (bound) return true;
+      }
       return res == true;
     } catch (e) {
       debugPrint("ShizukuService requestPermission error: $e");

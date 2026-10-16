@@ -95,12 +95,31 @@ class CallRecordService : Service() {
         }
     }
 
+    private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        Log.i(TAG, "Shizuku server binder received in CallRecordService sticky listener.")
+        checkAndBindService()
+    }
+
+    private val binderDeadListener = Shizuku.OnBinderDeadListener {
+        Log.w(TAG, "Shizuku server binder died.")
+        recorderService = null
+        isBound = false
+        MainActivity.instance?.onServiceStatusChanged(false)
+    }
+
     private val userServiceArgs by lazy {
+        val isDebug = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        val vCode = try {
+            val pInfo = packageManager.getPackageInfo(packageName, 0)
+            (pInfo.lastUpdateTime and 0x7FFFFFFF).toInt()
+        } catch (e: Throwable) {
+            10
+        }
         Shizuku.UserServiceArgs(ComponentName(packageName, CallRecorderUserService::class.java.name))
             .daemon(true)
             .processNameSuffix("call_recorder_service")
-            .debuggable(false)
-            .version(2)
+            .debuggable(isDebug)
+            .version(vCode)
     }
 
     private val deathRecipient = IBinder.DeathRecipient {
@@ -148,6 +167,14 @@ class CallRecordService : Service() {
         createNotificationChannel()
         startForegroundNotification("Call monitoring active")
         setupVoipCallDetection()
+
+        try {
+            Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
+            Shizuku.addBinderDeadListener(binderDeadListener)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Could not add Shizuku binder listener: ${e.message}")
+        }
+
         checkAndBindService()
     }
 
@@ -247,7 +274,7 @@ class CallRecordService : Service() {
                                 val currentMode = audioManager.mode
                                 if (currentMode == AudioManager.MODE_IN_COMMUNICATION) {
                                     Log.i(TAG, "VoIP microphone capture detected (WhatsApp) while IN_COMMUNICATION. Starting recording.")
-                                    val caller = VoipNotificationListener.lastCallerName ?: "WhatsApp Call"
+                                    val caller = VoipNotificationListener.getValidCallerName() ?: "WhatsApp Call"
                                     currentPhoneNumber = caller
                                     currentCallType = "voip"
                                     if (isVoipAutoSpeakerphone) {
@@ -283,7 +310,7 @@ class CallRecordService : Service() {
                             }
                             if (!isVoipCallActive) {
                                 isVoipCallActive = true
-                                val caller = VoipNotificationListener.lastCallerName ?: "WhatsApp Call"
+                                val caller = VoipNotificationListener.getValidCallerName() ?: "WhatsApp Call"
                                 currentPhoneNumber = caller
                                 currentCallType = "voip"
                                 Log.i(TAG, "VoIP call connected ($caller). Starting recording...")
@@ -455,16 +482,41 @@ class CallRecordService : Service() {
     }
 
     fun updateVoipCallerName(name: String) {
+        if (!isVoipCallActive) {
+            Log.d(TAG, "updateVoipCallerName called with '$name' but VoIP call is not active. Ignored.")
+            return
+        }
         if (name.isBlank() || name.equals("WhatsApp", ignoreCase = true) || name.equals("WhatsApp Call", ignoreCase = true)) return
         Log.i(TAG, "updateVoipCallerName: caller name updated to '$name'")
         currentPhoneNumber = name
         updateNotificationText("WhatsApp: $name")
+
+        // Rename recording file if currently recording with generic WhatsApp_Call name
+        try {
+            val curPath = currentFilePath
+            if (curPath != null && isRecording()) {
+                val curFile = File(curPath)
+                if (curFile.exists() && curFile.name.contains("WhatsApp_Call")) {
+                    val safeName = name.replace(Regex("[^a-zA-Z0-9+]"), "_")
+                    val newName = curFile.name.replace("WhatsApp_Call", safeName)
+                    val newFile = File(curFile.parentFile, newName)
+                    if (curFile.renameTo(newFile)) {
+                        currentFilePath = newFile.absolutePath
+                        Log.i(TAG, "Renamed active VoIP recording file to: ${newFile.name}")
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed renaming active VoIP recording: ${e.message}")
+        }
+
         MainActivity.instance?.onNativeCallStarted(name, "voip", currentFilePath ?: "", isRecording())
     }
 
     fun onCallEnded() {
         Log.i(TAG, "Call ended. Stopping recording.")
         val callerName = currentPhoneNumber
+        VoipNotificationListener.clearCallerName()
         isTelephonyCallActive = false
         isVoipCallActive = false
         isSpeakerActive = false
@@ -727,6 +779,10 @@ class CallRecordService : Service() {
                 audioRecordingCallback?.let { audioManager?.unregisterAudioRecordingCallback(it) }
             } catch (ignored: Throwable) {}
         }
+        try {
+            Shizuku.removeBinderReceivedListener(binderReceivedListener)
+            Shizuku.removeBinderDeadListener(binderDeadListener)
+        } catch (ignored: Throwable) {}
         try { currentPfd?.close() } catch (ignored: Throwable) {}
     }
 }

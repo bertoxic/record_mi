@@ -49,4 +49,5 @@ app.*.map.json
 *.wav
 test_*.png
 screenshot.png
+/android/build/
 

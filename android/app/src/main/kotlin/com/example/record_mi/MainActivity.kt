@@ -32,6 +32,20 @@ class MainActivity : FlutterActivity() {
     private var flutterMethodChannel: MethodChannel? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        Log.i(TAG, "Shizuku server binder received in MainActivity sticky listener")
+        try {
+            if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                CallRecordService.instance?.checkAndBindService()
+            }
+        } catch (ignored: Throwable) {}
+    }
+
+    private val binderDeadListener = Shizuku.OnBinderDeadListener {
+        Log.w(TAG, "Shizuku server binder died in MainActivity")
+        onServiceStatusChanged(false)
+    }
+
     private val permissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
         val granted = (grantResult == PackageManager.PERMISSION_GRANTED)
         Log.i(TAG, "Shizuku permission callback: code=$requestCode, granted=$granted")
@@ -80,6 +94,13 @@ class MainActivity : FlutterActivity() {
         instance = this
 
         ensureCallRecordServiceRunning()
+
+        try {
+            Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
+            Shizuku.addBinderDeadListener(binderDeadListener)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Could not add Shizuku binder listener: ${e.message}")
+        }
 
         val filter = IntentFilter().apply {
             addAction("com.example.record_mi.TEST_RECORD")
@@ -191,6 +212,13 @@ class MainActivity : FlutterActivity() {
 
             "isServiceBound" -> {
                 val bound = CallRecordService.instance?.isServiceBound() ?: false
+                if (!bound && isShizukuAlive()) {
+                    try {
+                        if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                            CallRecordService.instance?.checkAndBindService()
+                        }
+                    } catch (ignored: Throwable) {}
+                }
                 result.success(bound)
             }
 
@@ -484,6 +512,8 @@ class MainActivity : FlutterActivity() {
         } catch (ignored: Throwable) {}
 
         try {
+            Shizuku.removeBinderReceivedListener(binderReceivedListener)
+            Shizuku.removeBinderDeadListener(binderDeadListener)
             Shizuku.removeRequestPermissionResultListener(permissionListener)
         } catch (ignored: Throwable) {}
     }
