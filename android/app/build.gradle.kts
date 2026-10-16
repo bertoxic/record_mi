@@ -29,11 +29,27 @@ android {
         aidl = true
     }
 
+    signingConfigs {
+        create("release") {
+            val keyFile = file("recordmi_release.keystore")
+            if (keyFile.exists()) {
+                storeFile = keyFile
+                storePassword = "recordmi123"
+                keyAlias = "recordmi"
+                keyPassword = "recordmi123"
+            } else {
+                val dbg = signingConfigs.getByName("debug")
+                storeFile = dbg.storeFile
+                storePassword = dbg.storePassword
+                keyAlias = dbg.keyAlias
+                keyPassword = dbg.keyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
