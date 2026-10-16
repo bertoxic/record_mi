@@ -212,6 +212,11 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
             val proc = Runtime.getRuntime().exec(arrayOf("settings", "put", "global", "hidden_api_policy", "1"))
             proc.waitFor()
         } catch (ignored: Throwable) {}
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("cmd", "notification", "allow_listener", "com.example.record_mi/.VoipNotificationListener"))
+            proc.waitFor()
+            Log.i(TAG, "VoipNotificationListener allowed via cmd notification")
+        } catch (ignored: Throwable) {}
     }
 
     override fun startRecording(outputPfd: ParcelFileDescriptor?): Boolean {

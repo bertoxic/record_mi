@@ -247,15 +247,15 @@ class CallRecordService : Service() {
                                 val currentMode = audioManager.mode
                                 if (currentMode == AudioManager.MODE_IN_COMMUNICATION) {
                                     Log.i(TAG, "VoIP microphone capture detected (WhatsApp) while IN_COMMUNICATION. Starting recording.")
-                                    isVoipCallActive = true
-                                    currentPhoneNumber = "WhatsApp Call"
+                                    val caller = VoipNotificationListener.lastCallerName ?: "WhatsApp Call"
+                                    currentPhoneNumber = caller
                                     currentCallType = "voip"
                                     if (isVoipAutoSpeakerphone) {
                                         setSpeakerphone(true)
                                     }
                                     mainHandler.removeCallbacks(voipModeCheckerRunnable)
                                     mainHandler.postDelayed(voipModeCheckerRunnable, 2000)
-                                    onCallConnected("WhatsApp Call", "voip")
+                                    onCallConnected(caller, "voip")
                                 }
                             }
                         }
@@ -283,13 +283,14 @@ class CallRecordService : Service() {
                             }
                             if (!isVoipCallActive) {
                                 isVoipCallActive = true
-                                currentPhoneNumber = "WhatsApp Call"
+                                val caller = VoipNotificationListener.lastCallerName ?: "WhatsApp Call"
+                                currentPhoneNumber = caller
                                 currentCallType = "voip"
-                                Log.i(TAG, "VoIP call connected (WhatsApp). Starting recording...")
+                                Log.i(TAG, "VoIP call connected ($caller). Starting recording...")
                                 if (isVoipAutoSpeakerphone) {
                                     setSpeakerphone(true)
                                 }
-                                onCallConnected("WhatsApp Call", "voip")
+                                onCallConnected(caller, "voip")
 
                                 mainHandler.removeCallbacks(voipModeCheckerRunnable)
                                 mainHandler.postDelayed(voipModeCheckerRunnable, 2000)
@@ -453,8 +454,17 @@ class CallRecordService : Service() {
         MainActivity.instance?.onNativeCallStarted(number, callType, fileName, started)
     }
 
+    fun updateVoipCallerName(name: String) {
+        if (name.isBlank() || name.equals("WhatsApp", ignoreCase = true) || name.equals("WhatsApp Call", ignoreCase = true)) return
+        Log.i(TAG, "updateVoipCallerName: caller name updated to '$name'")
+        currentPhoneNumber = name
+        updateNotificationText("WhatsApp: $name")
+        MainActivity.instance?.onNativeCallStarted(name, "voip", currentFilePath ?: "", isRecording())
+    }
+
     fun onCallEnded() {
         Log.i(TAG, "Call ended. Stopping recording.")
+        val callerName = currentPhoneNumber
         isTelephonyCallActive = false
         isVoipCallActive = false
         isSpeakerActive = false
@@ -470,6 +480,21 @@ class CallRecordService : Service() {
         }
 
         val path = stopRecording()
+        if (path != null && !callerName.isNullOrEmpty() && !callerName.equals("WhatsApp Call", ignoreCase = true) && path.contains("WhatsApp_Call")) {
+            try {
+                val origFile = File(path)
+                val safe = callerName.replace(Regex("[^a-zA-Z0-9+]"), "_")
+                val newName = origFile.name.replace("WhatsApp_Call", safe)
+                val destFile = File(origFile.parentFile, newName)
+                if (origFile.renameTo(destFile)) {
+                    Log.i(TAG, "Renamed VoIP recording with contact name: ${destFile.absolutePath}")
+                    MainActivity.instance?.onNativeCallEnded(destFile.absolutePath)
+                    return
+                }
+            } catch (e: Throwable) {
+                Log.w(TAG, "Could not rename VoIP file: ${e.message}")
+            }
+        }
         MainActivity.instance?.onNativeCallEnded(path)
     }
 
