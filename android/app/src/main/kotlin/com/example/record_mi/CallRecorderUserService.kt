@@ -83,9 +83,49 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
 
     init {
         Log.i(TAG, "CallRecorderUserService instantiated (Process UID: ${android.os.Process.myUid()})")
+        terminateStaleDaemonInstances()
         fixActivityThread()
         grantHiddenAppOps()
         initHiddenApiExemptions()
+        resetAudioSystemRouting()
+    }
+
+    private fun terminateStaleDaemonInstances() {
+        try {
+            val myPid = android.os.Process.myPid()
+            val procDir = java.io.File("/proc")
+            val pids = procDir.listFiles { f -> f.isDirectory && f.name.all { c -> c.isDigit() } } ?: return
+            for (p in pids) {
+                val pid = p.name.toIntOrNull() ?: continue
+                if (pid == myPid) continue
+                try {
+                    val cmdlineFile = java.io.File(p, "cmdline")
+                    if (cmdlineFile.exists()) {
+                        val cmdline = cmdlineFile.readText()
+                        if (cmdline.contains("com.example.record_mi:call_recorder_service")) {
+                            Log.w(TAG, "Terminating stale Shizuku daemon process PID: $pid")
+                            android.os.Process.killProcess(pid)
+                        }
+                    }
+                } catch (ignored: Throwable) {}
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "terminateStaleDaemonInstances error: ${e.message}")
+        }
+    }
+
+    private fun resetAudioSystemRouting() {
+        try {
+            val audioSystemClass = Class.forName("android.media.AudioSystem")
+            val setForceUseMethod = audioSystemClass.getMethod(
+                "setForceUse",
+                Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            )
+            // Ensure FOR_RECORD (1) is always clean (FORCE_NONE = 0) so microphone routing is never disrupted
+            setForceUseMethod.invoke(null, 1, 0)
+            Log.i(TAG, "Cleaned up AudioSystem FOR_RECORD routing to FORCE_NONE")
+        } catch (ignored: Throwable) {}
     }
 
     private fun initHiddenApiExemptions() {
@@ -264,12 +304,20 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
         val isSamsung = Build.MANUFACTURER.contains("samsung", ignoreCase = true)
         val ctx = getEffectiveContext()
         val audioManager = ctx?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        val isModeInComm = audioManager?.mode == AudioManager.MODE_IN_COMMUNICATION
-        val isVoip = (callType?.contains("voip", ignoreCase = true) == true) || isModeInComm
-        val isWav = callType?.contains("wav", ignoreCase = true) == true
-        val is3gp = callType?.contains("3gp", ignoreCase = true) == true
+        val currentMode = audioManager?.mode ?: AudioManager.MODE_NORMAL
+        // Priority #1: Branch strictly on AudioManager.mode as required by Android audio architecture:
+        // - MODE_IN_COMMUNICATION (3): VoIP call (WhatsApp, Telegram, etc.) -> Privileged Dual-Stream AudioPolicy Loopback
+        // - MODE_IN_CALL (2): Normal Cellular Call -> Baseband Engine (MediaRecorder VOICE_CALL = 4)
+        val isModeInComm = (currentMode == AudioManager.MODE_IN_COMMUNICATION)
+        val isVoip = isModeInComm || (callType?.contains("voip", ignoreCase = true) == true)
+        val isCellular = !isVoip && (currentMode == AudioManager.MODE_IN_CALL ||
+                         callType?.contains("cellular", ignoreCase = true) == true ||
+                         callType?.contains("incoming", ignoreCase = true) == true ||
+                         callType?.contains("outgoing", ignoreCase = true) == true)
+        val isWav = isVoip || (callType?.contains("wav", ignoreCase = true) == true)
+        val is3gp = !isVoip && (callType?.contains("3gp", ignoreCase = true) == true)
 
-        Log.i(TAG, "startRecordingWithOptions: callType='$callType', isVoip=$isVoip (modeInComm=$isModeInComm), isSamsung=$isSamsung, isWav=$isWav, is3gp=$is3gp")
+        Log.i(TAG, "startRecordingWithOptions: callType='$callType', mode=$currentMode, isVoip=$isVoip, isCellular=$isCellular, isSamsung=$isSamsung, isWav=$isWav, is3gp=$is3gp")
 
         // 1. PRIORITY FOR VOIP (WhatsApp): Privileged Dual-Stream AudioPolicy capture (WhatsApp downlink + local mic mixer)
         if (isVoip) {
@@ -291,9 +339,11 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
         // Opening VOICE_COMMUNICATION while WhatsApp is active causes Android AudioPolicy
         // to assign exclusive communication capture to UID 2000, muting WhatsApp's microphone
         // so the other caller cannot hear the user.
-        // Using CAMCORDER (5) and VOICE_RECOGNITION (6) allows concurrent capture without muting WhatsApp and
-        // disables echo cancellation so the loudspeaker is captured along with local voice.
+        // Using MIC (1) or CAMCORDER (5) allows concurrent capture without muting WhatsApp.
         if (isVoip) {
+            if (!candidateSources.contains(MediaRecorder.AudioSource.MIC)) {
+                candidateSources.add(MediaRecorder.AudioSource.MIC) // 1 (Safe concurrent capture)
+            }
             if (!candidateSources.contains(MediaRecorder.AudioSource.CAMCORDER)) {
                 candidateSources.add(MediaRecorder.AudioSource.CAMCORDER) // 5 (Omnidirectional, AEC-bypassed)
             }
@@ -303,17 +353,20 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !candidateSources.contains(MediaRecorder.AudioSource.UNPROCESSED)) {
                 candidateSources.add(MediaRecorder.AudioSource.UNPROCESSED) // 9
             }
-            if (!candidateSources.contains(MediaRecorder.AudioSource.MIC)) {
-                candidateSources.add(MediaRecorder.AudioSource.MIC) // 1
-            }
             if (!candidateSources.contains(MediaRecorder.AudioSource.DEFAULT)) {
                 candidateSources.add(MediaRecorder.AudioSource.DEFAULT) // 0
             }
-        } else if (isSamsung) {
-            // On Samsung One UI, VOICE_RECOGNITION (6) disables DSP echo cancellation
-            // so both the caller (local mic) and receiver (earpiece/speaker) are captured clearly.
-            if (!candidateSources.contains(MediaRecorder.AudioSource.VOICE_RECOGNITION)) {
-                candidateSources.add(MediaRecorder.AudioSource.VOICE_RECOGNITION) // 6
+        } else {
+            // Cellular calls (Incoming, Outgoing, Telephony)
+            // Priority #1: MediaRecorder.AudioSource.VOICE_CALL (4)
+            // Under Shizuku (UID 2000 / com.android.shell with CAPTURE_AUDIO_OUTPUT),
+            // VOICE_CALL connects directly to the hardware baseband loop, capturing BOTH
+            // VOICE_UPLINK (device microphone) and VOICE_DOWNLINK (remote caller from cell tower).
+            if (!candidateSources.contains(MediaRecorder.AudioSource.VOICE_CALL)) {
+                candidateSources.add(MediaRecorder.AudioSource.VOICE_CALL) // 4 (Baseband 2-way call audio)
+            }
+            if (!candidateSources.contains(2 /* VOICE_DOWNLINK */)) {
+                candidateSources.add(2) // 2 (Baseband remote caller audio)
             }
             if (!candidateSources.contains(MediaRecorder.AudioSource.VOICE_COMMUNICATION)) {
                 candidateSources.add(MediaRecorder.AudioSource.VOICE_COMMUNICATION) // 7
@@ -321,21 +374,14 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
             if (!candidateSources.contains(MediaRecorder.AudioSource.MIC)) {
                 candidateSources.add(MediaRecorder.AudioSource.MIC) // 1
             }
-            if (!candidateSources.contains(MediaRecorder.AudioSource.VOICE_CALL)) {
-                candidateSources.add(MediaRecorder.AudioSource.VOICE_CALL) // 4
-            }
-        } else {
-            if (!candidateSources.contains(MediaRecorder.AudioSource.VOICE_CALL)) {
-                candidateSources.add(MediaRecorder.AudioSource.VOICE_CALL)
-            }
-            if (!candidateSources.contains(MediaRecorder.AudioSource.VOICE_COMMUNICATION)) {
-                candidateSources.add(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
-            }
-            if (!candidateSources.contains(MediaRecorder.AudioSource.MIC)) {
-                candidateSources.add(MediaRecorder.AudioSource.MIC)
-            }
             if (!candidateSources.contains(MediaRecorder.AudioSource.VOICE_RECOGNITION)) {
-                candidateSources.add(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+                candidateSources.add(MediaRecorder.AudioSource.VOICE_RECOGNITION) // 6
+            }
+            if (!candidateSources.contains(MediaRecorder.AudioSource.CAMCORDER)) {
+                candidateSources.add(MediaRecorder.AudioSource.CAMCORDER) // 5
+            }
+            if (!candidateSources.contains(MediaRecorder.AudioSource.DEFAULT)) {
+                candidateSources.add(MediaRecorder.AudioSource.DEFAULT) // 0
             }
         }
 
@@ -353,23 +399,51 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
             }
         }
 
-        // 2. Try MediaRecorder (hardware accelerated AAC/MPEG-4 or AMR-WB/3GP)
-        for (source in candidateSources) {
+        // 2. For cellular calls, FIRST prioritize capturing baseband two-way audio (VOICE_CALL=4, VOICE_DOWNLINK=2)
+        // across BOTH MediaRecorder and AudioRecord BEFORE falling back to mic-only sources!
+        val basebandSources = candidateSources.filter {
+            it == MediaRecorder.AudioSource.VOICE_CALL || it == 2 /* VOICE_DOWNLINK */
+        }
+        val fallbackSources = candidateSources.filterNot {
+            it == MediaRecorder.AudioSource.VOICE_CALL || it == 2 /* VOICE_DOWNLINK */
+        }
+
+        // Try baseband sources with MediaRecorder first (hardware AAC/M4A or AMR-WB/3GP)
+        for (source in basebandSources) {
             if (tryInitRecorderWithSource(outputPfd, source, is3gp)) {
                 isCurrentlyRecording = true
                 activeSource = source
-                Log.i(TAG, "Recording started successfully with MediaRecorder (AudioSource: $source)")
+                Log.i(TAG, "Recording started successfully with MediaRecorder (Baseband AudioSource: $source)")
                 return true
             }
         }
 
-        // 3. Fall back to AudioRecord (direct HAL PCM streamer)
-        Log.w(TAG, "MediaRecorder failed for all candidates. Falling back to AudioRecord PCM/WAV streamer...")
-        for (source in candidateSources) {
+        // If MediaRecorder failed for baseband sources, try baseband sources with AudioRecord (direct HAL PCM/WAV streamer)
+        for (source in basebandSources) {
             if (tryInitAudioRecordWithSource(outputPfd, source)) {
                 isCurrentlyRecording = true
                 activeSource = source
-                Log.i(TAG, "Recording started successfully with AudioRecord (AudioSource: $source)")
+                Log.i(TAG, "Recording started successfully with AudioRecord (Baseband AudioSource: $source)")
+                return true
+            }
+        }
+
+        // 3. Fall back to standard microphone/communication sources if baseband taps are restricted on this device
+        Log.w(TAG, "Baseband recording unavailable. Falling back to mic/communication sources...")
+        for (source in fallbackSources) {
+            if (tryInitRecorderWithSource(outputPfd, source, is3gp)) {
+                isCurrentlyRecording = true
+                activeSource = source
+                Log.i(TAG, "Recording started with MediaRecorder fallback (AudioSource: $source)")
+                return true
+            }
+        }
+
+        for (source in fallbackSources) {
+            if (tryInitAudioRecordWithSource(outputPfd, source)) {
+                isCurrentlyRecording = true
+                activeSource = source
+                Log.i(TAG, "Recording started with AudioRecord fallback (AudioSource: $source)")
                 return true
             }
         }
@@ -512,14 +586,16 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
         val downlink = downlinkPair.second
 
         // 2. Open Uplink (Local user's microphone)
-        // Candidate sources: VOICE_RECOGNITION captures clear local voice without seizing exclusive communication capture
+        // Candidate sources: MIC (1) / CAMCORDER (5) capture clear local speech without seizing exclusive communication capture
+        // Never use VOICE_COMMUNICATION for VoIP uplink as it silences WhatsApp's mic input!
         val candidateUplinkSources = mutableListOf<Int>()
-        if (preferredSource > 0) candidateUplinkSources.add(preferredSource)
+        if (preferredSource > 0 && preferredSource != MediaRecorder.AudioSource.VOICE_COMMUNICATION) {
+            candidateUplinkSources.add(preferredSource)
+        }
         candidateUplinkSources.addAll(listOf(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION,
             MediaRecorder.AudioSource.MIC,
             MediaRecorder.AudioSource.CAMCORDER,
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
         ))
 
         val ctx = getEffectiveContext()
@@ -538,6 +614,13 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
                             .build()
                     )
                     .setBufferSizeInBytes(bufferSize)
+
+                // Critical: mark as NOT privacy sensitive so Android AudioPolicy does NOT silence WhatsApp or active calls!
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    try {
+                        builder.setPrivacySensitive(false)
+                    } catch (ignored: Throwable) {}
+                }
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && shellContext != null) {
                     try {
@@ -613,23 +696,36 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
         isAudioRecordRunning = true
         audioRecordBytesWritten = 0L
 
-        val chunkSamples = 320 // 20ms at 16000 Hz
+        val chunkSamples = 320 // 20ms at 16000 Hz Mono
         val uplinkQueue = LinkedBlockingQueue<ShortArray>(50)
         val downlinkQueue = LinkedBlockingQueue<ShortArray>(50)
+
+        // Helper: read exact number of samples to prevent frame misalignments
+        fun readExact(record: AudioRecord, buffer: ShortArray): Boolean {
+            var offset = 0
+            while (offset < buffer.size && isAudioRecordRunning) {
+                val r = record.read(buffer, offset, buffer.size - offset)
+                if (r < 0) {
+                    Log.w(TAG, "AudioRecord.read error: $r")
+                    return false
+                }
+                if (r == 0) {
+                    try { Thread.sleep(2) } catch (ignored: Throwable) {}
+                    continue
+                }
+                offset += r
+            }
+            return offset == buffer.size
+        }
 
         val uThread = Thread({
             val buf = ShortArray(chunkSamples)
             try {
                 while (isAudioRecordRunning) {
-                    val read = uplink.read(buf, 0, buf.size)
-                    if (read > 0) {
-                        val copy = buf.copyOf(read)
-                        while (!uplinkQueue.offer(copy, 10, TimeUnit.MILLISECONDS) && isAudioRecordRunning) {
-                            uplinkQueue.poll()
-                        }
-                    } else if (read < 0) {
-                        Log.w(TAG, "VoIP uplink.read returned: $read")
-                        break
+                    if (!readExact(uplink, buf)) break
+                    val copy = buf.copyOf(buf.size)
+                    while (!uplinkQueue.offer(copy, 10, TimeUnit.MILLISECONDS) && isAudioRecordRunning) {
+                        uplinkQueue.poll()
                     }
                 }
             } catch (e: Throwable) {
@@ -638,18 +734,24 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
         }, "VoipUplinkReader")
 
         val dThread = Thread({
-            val buf = ShortArray(chunkSamples)
+            val channels = downlink.channelCount
+            val readBuf = ShortArray(chunkSamples * channels)
+            val monoBuf = ShortArray(chunkSamples)
             try {
                 while (isAudioRecordRunning) {
-                    val read = downlink.read(buf, 0, buf.size)
-                    if (read > 0) {
-                        val copy = buf.copyOf(read)
-                        while (!downlinkQueue.offer(copy, 10, TimeUnit.MILLISECONDS) && isAudioRecordRunning) {
-                            downlinkQueue.poll()
+                    if (!readExact(downlink, readBuf)) break
+                    if (channels == 2) {
+                        for (i in 0 until chunkSamples) {
+                            val left = readBuf[i * 2].toInt()
+                            val right = readBuf[i * 2 + 1].toInt()
+                            monoBuf[i] = ((left + right) / 2).toShort()
                         }
-                    } else if (read < 0) {
-                        Log.w(TAG, "VoIP downlink.read returned: $read")
-                        break
+                    } else {
+                        System.arraycopy(readBuf, 0, monoBuf, 0, chunkSamples)
+                    }
+                    val copy = monoBuf.copyOf(chunkSamples)
+                    while (!downlinkQueue.offer(copy, 10, TimeUnit.MILLISECONDS) && isAudioRecordRunning) {
+                        downlinkQueue.poll()
                     }
                 }
             } catch (e: Throwable) {
@@ -666,31 +768,43 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
                 val mixedBytes = ByteArray(chunkSamples * 2)
 
                 while (isAudioRecordRunning) {
-                    val micChunk = uplinkQueue.poll(20, TimeUnit.MILLISECONDS)
-                    val spkChunk = downlinkQueue.poll()
-
-                    if (micChunk == null && spkChunk == null) {
+                    // Poll master mic chunk (hardware real-time clock)
+                    val micChunk = uplinkQueue.poll(40, TimeUnit.MILLISECONDS)
+                    if (micChunk == null) {
                         continue
                     }
 
-                    val samples = maxOf(micChunk?.size ?: 0, spkChunk?.size ?: 0)
-                    if (samples == 0) continue
+                    // Keep downlink audio aligned without discarding short delivery bursts:
+                    // Only drop stale chunks if severe backlog forms (> 15 chunks = > 300ms drift)
+                    while (downlinkQueue.size > 15) {
+                        downlinkQueue.poll()
+                    }
+                    val spkChunk = downlinkQueue.poll()
 
-                    val outByteLen = samples * 2
-                    val byteBuf = if (mixedBytes.size >= outByteLen) mixedBytes else ByteArray(outByteLen)
+                    // Mix exactly 320 samples with hyperbolic soft saturation to eliminate digital cracking
+                    for (i in 0 until chunkSamples) {
+                        val m = micChunk[i].toInt()
+                        val rawSpk = if (spkChunk != null) spkChunk[i].toInt() else 0
+                        val s = (rawSpk * 1.6f).toInt()
+                        val sum = m + s
 
-                    for (i in 0 until samples) {
-                        val m = if (micChunk != null && i < micChunk.size) micChunk[i].toInt() else 0
-                        val rawSpk = if (spkChunk != null && i < spkChunk.size) spkChunk[i].toInt() else 0
-                        val s = (rawSpk * 1.35f).toInt()
+                        val limited = if (sum > 28000) {
+                            val excess = (sum - 28000).toDouble()
+                            (28000 + (excess / (1.0 + excess / 4767.0))).toInt()
+                        } else if (sum < -28000) {
+                            val excess = (-sum - 28000).toDouble()
+                            -(28000 + (excess / (1.0 + excess / 4767.0))).toInt()
+                        } else {
+                            sum
+                        }
 
-                        val mixed = (m + s).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                        byteBuf[i * 2] = (mixed.toInt() and 0xFF).toByte()
-                        byteBuf[i * 2 + 1] = ((mixed.toInt() shr 8) and 0xFF).toByte()
+                        val sample = limited.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                        mixedBytes[i * 2] = (sample.toInt() and 0xFF).toByte()
+                        mixedBytes[i * 2 + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
                     }
 
-                    fos.write(byteBuf, 0, outByteLen)
-                    audioRecordBytesWritten += outByteLen
+                    fos.write(mixedBytes, 0, mixedBytes.size)
+                    audioRecordBytesWritten += mixedBytes.size
                 }
 
                 // Drain remaining buffered samples upon stop
@@ -699,23 +813,29 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
                     val spkChunk = downlinkQueue.poll()
                     if (micChunk == null && spkChunk == null) break
 
-                    val samples = maxOf(micChunk?.size ?: 0, spkChunk?.size ?: 0)
-                    if (samples == 0) break
-                    val outByteLen = samples * 2
-                    val byteBuf = if (mixedBytes.size >= outByteLen) mixedBytes else ByteArray(outByteLen)
-
-                    for (i in 0 until samples) {
+                    for (i in 0 until chunkSamples) {
                         val m = if (micChunk != null && i < micChunk.size) micChunk[i].toInt() else 0
                         val rawSpk = if (spkChunk != null && i < spkChunk.size) spkChunk[i].toInt() else 0
-                        val s = (rawSpk * 1.35f).toInt()
+                        val s = (rawSpk * 1.6f).toInt()
+                        val sum = m + s
 
-                        val mixed = (m + s).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                        byteBuf[i * 2] = (mixed.toInt() and 0xFF).toByte()
-                        byteBuf[i * 2 + 1] = ((mixed.toInt() shr 8) and 0xFF).toByte()
+                        val limited = if (sum > 28000) {
+                            val excess = (sum - 28000).toDouble()
+                            (28000 + (excess / (1.0 + excess / 4767.0))).toInt()
+                        } else if (sum < -28000) {
+                            val excess = (-sum - 28000).toDouble()
+                            -(28000 + (excess / (1.0 + excess / 4767.0))).toInt()
+                        } else {
+                            sum
+                        }
+
+                        val sample = limited.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                        mixedBytes[i * 2] = (sample.toInt() and 0xFF).toByte()
+                        mixedBytes[i * 2 + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
                     }
 
-                    fos.write(byteBuf, 0, outByteLen)
-                    audioRecordBytesWritten += outByteLen
+                    fos.write(mixedBytes, 0, mixedBytes.size)
+                    audioRecordBytesWritten += mixedBytes.size
                 }
 
                 fos.flush()
@@ -747,6 +867,21 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
                 rec = createMediaRecorder()
                 rec.apply {
                     setAudioSource(source)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        // Telephony baseband sources (VOICE_CALL=4, VOICE_DOWNLINK=2, VOICE_UPLINK=3, REMOTE_SUBMIX=8)
+                        // MUST remain at PRIVACY_SENSITIVE_DEFAULT. Android StagefrightRecorder throws
+                        // "Cannot request private capture with source: 4" (-2147483648) if setPrivacySensitive is invoked!
+                        if (source != MediaRecorder.AudioSource.VOICE_CALL &&
+                            source != 2 /* VOICE_DOWNLINK */ &&
+                            source != 3 /* VOICE_UPLINK */ &&
+                            source != 8 /* REMOTE_SUBMIX */) {
+                            try {
+                                setPrivacySensitive(false)
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "setPrivacySensitive(false) note: ${e.message}")
+                            }
+                        }
+                    }
                     setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                     setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                     try {
@@ -776,6 +911,18 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
                 rec = createMediaRecorder()
                 rec.apply {
                     setAudioSource(source)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        if (source != MediaRecorder.AudioSource.VOICE_CALL &&
+                            source != 2 /* VOICE_DOWNLINK */ &&
+                            source != 3 /* VOICE_UPLINK */ &&
+                            source != 8 /* REMOTE_SUBMIX */) {
+                            try {
+                                setPrivacySensitive(false)
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "setPrivacySensitive(false) note: ${e.message}")
+                            }
+                        }
+                    }
                     setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
                     setAudioEncoder(MediaRecorder.AudioEncoder.AMR_WB)
                     setOutputFile(pfd.fileDescriptor)
@@ -804,7 +951,7 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
         source: Int,
         applyVoipBoost: Boolean = false
     ): Boolean {
-        for (rate in listOf(48000, 16000, 44100)) {
+        for (rate in listOf(16000, 48000, 8000, 44100)) {
             try {
                 val minBuf = AudioRecord.getMinBufferSize(
                     rate,
@@ -829,6 +976,17 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
                                 .build()
                         )
                         .setBufferSizeInBytes(bufSize)
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        if (source != MediaRecorder.AudioSource.VOICE_CALL &&
+                            source != 2 /* VOICE_DOWNLINK */ &&
+                            source != 3 /* VOICE_UPLINK */ &&
+                            source != 8 /* REMOTE_SUBMIX */) {
+                            try {
+                                builder.setPrivacySensitive(false)
+                            } catch (ignored: Throwable) {}
+                        }
+                    }
 
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && shellContext != null) {
                         try {
@@ -1126,17 +1284,10 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
     override fun setSpeakerphone(on: Boolean): Boolean {
         var success = false
 
-        // 1. Force global hardware audio routing via AudioSystem.setParameters & setForceUse
+        // 1. Safe AudioSystem routing via AudioSystem.setForceUse ONLY for FOR_COMMUNICATION and FOR_MEDIA.
+        // NEVER touch FOR_RECORD with FORCE_SPEAKER (which corrupts microphone input routing to AUDIO_DEVICE_NONE)!
         try {
             val audioSystemClass = Class.forName("android.media.AudioSystem")
-            try {
-                val setParametersMethod = audioSystemClass.getMethod("setParameters", String::class.java)
-                setParametersMethod.invoke(null, if (on) "routing=2" else "routing=0")
-                setParametersMethod.invoke(null, if (on) "speaker=on" else "speaker=off")
-                setParametersMethod.invoke(null, if (on) "audio_devices=2" else "audio_devices=1")
-                Log.i(TAG, "Privileged AudioSystem.setParameters applied via UID 2000 (speaker=$on)")
-            } catch (ignored: Throwable) {}
-
             val setForceUseMethod = audioSystemClass.getMethod(
                 "setForceUse",
                 Int::class.javaPrimitiveType,
@@ -1146,8 +1297,8 @@ class CallRecorderUserService(private var context: Context?) : ICallRecorderServ
             setForceUseMethod.invoke(null, 0, if (on) 1 else 0)
             // 2 = FOR_MEDIA, 1 = FORCE_SPEAKER, 0 = FORCE_NONE
             setForceUseMethod.invoke(null, 2, if (on) 1 else 0)
-            // 1 = FOR_RECORD, 1 = FORCE_SPEAKER, 0 = FORCE_NONE
-            setForceUseMethod.invoke(null, 1, if (on) 1 else 0)
+            // Ensure FOR_RECORD (1) is always clean (FORCE_NONE = 0) so microphone is never forced to speaker
+            setForceUseMethod.invoke(null, 1, 0)
             Log.i(TAG, "Privileged AudioSystem.setForceUse speakerphone=$on applied via UID 2000")
             success = true
         } catch (e: Throwable) {

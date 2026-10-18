@@ -22,13 +22,30 @@ class VoipNotificationListener : NotificationListenerService() {
         var lastCallerTimestamp: Long = 0L
             private set
 
+        @Volatile
+        var isVoipCallActive: Boolean = false
+            private set
+
         /**
-         * Returns the cached caller name if extracted within the last 30 seconds, or null.
+         * Checks whether an active VoIP call notification was posted and is still valid.
+         */
+        fun hasActiveVoipCall(): Boolean {
+            val valid = isVoipCallActive && (System.currentTimeMillis() - lastCallerTimestamp < 45_000L)
+            if (!valid && isVoipCallActive && (System.currentTimeMillis() - lastCallerTimestamp >= 45_000L)) {
+                isVoipCallActive = false
+                lastCallerName = null
+            }
+            return valid
+        }
+
+        /**
+         * Returns the cached caller name if extracted within the last 45 seconds, or null.
          */
         fun getValidCallerName(): String? {
             val name = lastCallerName ?: return null
-            if (System.currentTimeMillis() - lastCallerTimestamp > 30_000L) {
+            if (System.currentTimeMillis() - lastCallerTimestamp > 45_000L) {
                 lastCallerName = null
+                isVoipCallActive = false
                 return null
             }
             return name
@@ -37,6 +54,7 @@ class VoipNotificationListener : NotificationListenerService() {
         fun clearCallerName() {
             lastCallerName = null
             lastCallerTimestamp = 0L
+            isVoipCallActive = false
         }
     }
 
@@ -90,6 +108,9 @@ class VoipNotificationListener : NotificationListenerService() {
                 title = title.substringBefore("\n").trim()
             }
 
+            isVoipCallActive = true
+            lastCallerTimestamp = System.currentTimeMillis()
+
             if (!title.isNullOrEmpty() &&
                 !title.equals("WhatsApp", ignoreCase = true) &&
                 !title.equals("WhatsApp Call", ignoreCase = true) &&
@@ -99,8 +120,13 @@ class VoipNotificationListener : NotificationListenerService() {
             ) {
                 Log.i(TAG, "Detected VoIP call notification from: '$title' (pkg=$pkg)")
                 lastCallerName = title
-                lastCallerTimestamp = System.currentTimeMillis()
                 CallRecordService.instance?.updateVoipCallerName(title)
+            } else {
+                Log.i(TAG, "Detected generic VoIP call notification (pkg=$pkg)")
+                if (lastCallerName == null) {
+                    lastCallerName = "WhatsApp Call"
+                }
+                CallRecordService.instance?.updateVoipCallerName(lastCallerName ?: "WhatsApp Call")
             }
         }
     }
@@ -110,8 +136,13 @@ class VoipNotificationListener : NotificationListenerService() {
         val pkg = sbn.packageName ?: return
         if (pkg.contains("whatsapp", ignoreCase = true) || pkg.contains("telegram", ignoreCase = true)) {
             val notification = sbn.notification
-            if (notification?.category == Notification.CATEGORY_CALL) {
-                Log.d(TAG, "VoIP call notification removed. Clearing cached caller name.")
+            val isCallCategory = (notification?.category == Notification.CATEGORY_CALL)
+            val hasCallActions = notification?.actions?.any { action ->
+                val title = action.title?.toString()?.lowercase() ?: ""
+                title.contains("decline") || title.contains("answer") || title.contains("end call") || title.contains("hang up")
+            } == true
+            if (isCallCategory || hasCallActions) {
+                Log.d(TAG, "VoIP call notification removed. Clearing cached caller state.")
                 clearCallerName()
             }
         }

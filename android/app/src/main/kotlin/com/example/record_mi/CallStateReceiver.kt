@@ -120,6 +120,12 @@ class CallStateReceiver : BroadcastReceiver() {
                 isOutgoing = false
                 currentNumber = incomingNumber
                 Log.i(TAG, "Incoming call ringing from: $incomingNumber")
+                if (VoipNotificationListener.hasActiveVoipCall()) {
+                    val voipCaller = VoipNotificationListener.getValidCallerName() ?: incomingNumber
+                    Log.i(TAG, "VoIP notification active during RINGING broadcast. Forwarding as voip ($voipCaller).")
+                    sendToService(context, CallRecordService.ACTION_CALL_RINGING, voipCaller, "voip")
+                    return
+                }
                 sendToService(context, CallRecordService.ACTION_CALL_RINGING, incomingNumber, "incoming")
             }
 
@@ -131,6 +137,19 @@ class CallStateReceiver : BroadcastReceiver() {
 
                 val num = currentNumber ?: incomingNumber
                 val resolvedNum = resolveContactNumber(context, num)
+
+                // Check if this OFFHOOK event is triggered by a WhatsApp/VoIP Telecom Connection:
+                val am = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+                val isVoipMode = (am != null && am.mode == android.media.AudioManager.MODE_IN_COMMUNICATION)
+                val hasVoipNotif = VoipNotificationListener.hasActiveVoipCall()
+
+                if (hasVoipNotif || isVoipMode) {
+                    val voipCaller = VoipNotificationListener.getValidCallerName() ?: (if (resolvedNum != "Call") resolvedNum else "WhatsApp Call")
+                    Log.i(TAG, "VoIP call active during OFFHOOK broadcast (hasNotif=$hasVoipNotif, isVoipMode=$isVoipMode). Forwarding as voip ($voipCaller).")
+                    sendToService(context, CallRecordService.ACTION_CALL_OFFHOOK, voipCaller, "voip")
+                    return
+                }
+
                 val callType = if (isOutgoing) "outgoing" else "incoming"
                 Log.i(TAG, "Call answered / connected ($callType) with: $resolvedNum. Starting recording immediately!")
                 sendToService(context, CallRecordService.ACTION_CALL_OFFHOOK, resolvedNum, callType)
@@ -138,9 +157,14 @@ class CallStateReceiver : BroadcastReceiver() {
 
             TelephonyManager.EXTRA_STATE_IDLE -> {
                 // Call terminated
-                Log.i(TAG, "Call ended. Resetting state.")
+                Log.i(TAG, "TelephonyManager EXTRA_STATE_IDLE received. Call ended. Resetting state.")
                 isOutgoing = false
                 currentNumber = null
+                // If a VoIP call is currently active, do NOT terminate it based on telephony IDLE
+                if (VoipNotificationListener.hasActiveVoipCall()) {
+                    Log.d(TAG, "TelephonyManager IDLE received but VoIP notification still active. Postponing call end.")
+                    return
+                }
                 sendToService(context, CallRecordService.ACTION_CALL_IDLE)
             }
         }

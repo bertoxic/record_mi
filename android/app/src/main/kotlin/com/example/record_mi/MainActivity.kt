@@ -156,6 +156,8 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, LEGACY_CHANNEL)
             .setMethodCallHandler(handler)
 
+        OverlayControlChannel.register(flutterEngine)
+
         CallRecordService.instance?.checkAndBindService()
     }
 
@@ -295,15 +297,8 @@ class MainActivity : FlutterActivity() {
                 val files = dir.listFiles { f ->
                     f.isFile && (f.extension == "m4a" || f.extension == "aac" || f.extension == "3gp" || f.extension == "amr" || f.extension == "wav") && f.length() > 0L
                 } ?: emptyArray()
-                val validFiles = mutableListOf<File>()
-                for (f in files) {
-                    // Automatically clean up corrupt/aborted <=2KB remnant recordings (e.g. from previous premature drops)
-                    if (f.length() <= 2048L) {
-                        try { f.delete() } catch (ignored: Throwable) {}
-                        continue
-                    }
-                    validFiles.add(f)
-                }
+
+                val validFiles = files.sortedByDescending { it.lastModified() }
 
                 for (f in validFiles) {
                     val parts = f.nameWithoutExtension.split("_")
@@ -315,6 +310,9 @@ class MainActivity : FlutterActivity() {
                     } else if (parts.size == 3) {
                         type = parts[1].replaceFirstChar { it.uppercase() }
                         contact = parts[2].replace("_", " ").trim()
+                    } else if (f.name.startsWith("test_")) {
+                        type = "Test"
+                        contact = "Test Recording"
                     }
                     if (type.equals("Voip", ignoreCase = true) || f.name.contains("voip", ignoreCase = true)) {
                         type = "WhatsApp"
@@ -409,15 +407,20 @@ class MainActivity : FlutterActivity() {
 
     private fun prewarmOverlayEngine() {
         try {
-            if (io.flutter.embedding.engine.FlutterEngineCache.getInstance().get("myCachedEngine") == null) {
+            val cache = io.flutter.embedding.engine.FlutterEngineCache.getInstance()
+            var engine = cache.get("myCachedEngine")
+            if (engine == null) {
                 val enn = io.flutter.embedding.engine.FlutterEngineGroup(applicationContext)
                 val dEntry = io.flutter.embedding.engine.dart.DartExecutor.DartEntrypoint(
                     io.flutter.FlutterInjector.instance().flutterLoader().findAppBundlePath(),
                     "overlayMain"
                 )
-                val engine = enn.createAndRunEngine(applicationContext, dEntry)
-                io.flutter.embedding.engine.FlutterEngineCache.getInstance().put("myCachedEngine", engine)
+                engine = enn.createAndRunEngine(applicationContext, dEntry)
+                cache.put("myCachedEngine", engine)
                 Log.i(TAG, "Pre-warmed overlay FlutterEngine successfully.")
+            }
+            if (engine != null) {
+                OverlayControlChannel.register(engine)
             }
         } catch (e: Throwable) {
             Log.w(TAG, "Prewarming overlay engine: ${e.message}")

@@ -77,6 +77,9 @@ class CallRecordService : Service() {
     private var currentCallType: String = "cellular"
     private var voipConnectRunnable: Runnable? = null
     private var audioRecordingCallback: AudioManager.AudioRecordingCallback? = null
+    private var lastTelephonyCallEndTime = 0L
+    private var recordingStartTimeMillis = 0L
+    private var voipNonCommCount = 0
 
     private val voipModeCheckerRunnable = object : Runnable {
         override fun run() {
@@ -84,13 +87,21 @@ class CallRecordService : Service() {
             val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager
             if (audioManager != null) {
                 if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
-                    Log.i(TAG, "VoIP mode checker: mode is ${audioManager.mode} (no longer IN_COMMUNICATION). Ending call.")
-                    onCallEnded()
-                    return
+                    voipNonCommCount++
+                    val hasNotif = VoipNotificationListener.hasActiveVoipCall()
+                    Log.i(TAG, "VoIP mode checker: mode is ${audioManager.mode} (nonCommCount=$voipNonCommCount, hasNotif=$hasNotif)")
+                    if (voipNonCommCount >= 2 && !hasNotif) {
+                        Log.i(TAG, "VoIP mode checker confirmed call ended. Ending call.")
+                        voipNonCommCount = 0
+                        onCallEnded()
+                        return
+                    }
+                } else {
+                    voipNonCommCount = 0
                 }
             }
             if (isVoipCallActive) {
-                mainHandler.postDelayed(this, 1200)
+                mainHandler.postDelayed(this, 1500)
             }
         }
     }
@@ -261,8 +272,14 @@ class CallRecordService : Service() {
                     audioRecordingCallback = object : AudioManager.AudioRecordingCallback() {
                         override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>?) {
                             super.onRecordingConfigChanged(configs)
-                            // Crucial safeguard: NEVER trigger VoIP recording if a cellular call is active or ringing!
-                            if (isTelephonyCallActive) {
+                            // Crucial safeguard: NEVER trigger VoIP recording if a true cellular call is active (MODE_IN_CALL)
+                            if (audioManager.mode == AudioManager.MODE_IN_CALL) {
+                                return
+                            }
+                            if (System.currentTimeMillis() - lastTelephonyCallEndTime < 4000L) {
+                                return
+                            }
+                            if (!VoipNotificationListener.hasActiveVoipCall()) {
                                 return
                             }
 
@@ -270,10 +287,11 @@ class CallRecordService : Service() {
                                 cfg.clientAudioSource == MediaRecorder.AudioSource.VOICE_COMMUNICATION
                             } ?: false
 
-                            if (hasVoiceComm && !isRecording() && isVoipRecordingEnabled) {
+                            if (hasVoiceComm && !isRecording() && isVoipRecordingEnabled && !isVoipCallActive) {
                                 val currentMode = audioManager.mode
                                 if (currentMode == AudioManager.MODE_IN_COMMUNICATION) {
                                     Log.i(TAG, "VoIP microphone capture detected (WhatsApp) while IN_COMMUNICATION. Starting recording.")
+                                    isVoipCallActive = true
                                     val caller = VoipNotificationListener.getValidCallerName() ?: "WhatsApp Call"
                                     currentPhoneNumber = caller
                                     currentCallType = "voip"
@@ -281,7 +299,7 @@ class CallRecordService : Service() {
                                         setSpeakerphone(true)
                                     }
                                     mainHandler.removeCallbacks(voipModeCheckerRunnable)
-                                    mainHandler.postDelayed(voipModeCheckerRunnable, 2000)
+                                    mainHandler.postDelayed(voipModeCheckerRunnable, 2500)
                                     onCallConnected(caller, "voip")
                                 }
                             }
@@ -298,37 +316,65 @@ class CallRecordService : Service() {
                 audioManager.addOnModeChangedListener(
                     mainExecutor,
                     AudioManager.OnModeChangedListener { mode ->
-                        Log.i(TAG, "AudioManager mode changed: $mode (telephonyActive=$isTelephonyCallActive, voipActive=$isVoipCallActive)")
+                        Log.i(TAG, "AudioManager mode changed: $mode (telephonyActive=$isTelephonyCallActive, voipActive=$isVoipCallActive, callType=$currentCallType, recording=${isRecording()})")
+
                         if (mode == AudioManager.MODE_IN_COMMUNICATION) {
-                            if (isTelephonyCallActive) {
-                                Log.d(TAG, "Mode is IN_COMMUNICATION but telephony call is active. Skipping VoIP handling.")
-                                return@OnModeChangedListener
-                            }
                             if (!isVoipRecordingEnabled) {
                                 Log.i(TAG, "VoIP call detected but VoIP recording is disabled in settings. Skipping recording.")
                                 return@OnModeChangedListener
                             }
-                            if (!isVoipCallActive) {
-                                isVoipCallActive = true
-                                val caller = VoipNotificationListener.getValidCallerName() ?: "WhatsApp Call"
-                                currentPhoneNumber = caller
-                                currentCallType = "voip"
-                                Log.i(TAG, "VoIP call connected ($caller). Starting recording...")
-                                if (isVoipAutoSpeakerphone) {
-                                    setSpeakerphone(true)
-                                }
-                                onCallConnected(caller, "voip")
 
-                                mainHandler.removeCallbacks(voipModeCheckerRunnable)
-                                mainHandler.postDelayed(voipModeCheckerRunnable, 2000)
+                            // MODE_IN_COMMUNICATION is exclusively used by VoIP apps (WhatsApp, Telegram, etc.)
+                            // Reset telephony active flag because cellular calls never run in MODE_IN_COMMUNICATION
+                            isTelephonyCallActive = false
+
+                            val caller = VoipNotificationListener.getValidCallerName() ?: "WhatsApp Call"
+
+                            // If we are already actively recording this VoIP call as voip, maintain it
+                            if (isVoipCallActive && currentCallType == "voip" && isRecording()) {
+                                Log.d(TAG, "Mode is IN_COMMUNICATION and VoIP recording already running.")
+                                return@OnModeChangedListener
                             }
+
+                            // If currently recording under non-voip (e.g. premature cellular recording started by Samsung Telecom),
+                            // abort and immediately switch to VoIP dual-stream capture!
+                            if (isRecording() && currentCallType != "voip") {
+                                Log.i(TAG, "Aborting non-voip recording ($currentFilePath) because mode changed to IN_COMMUNICATION. Switching to VoIP!")
+                                val oldPath = currentFilePath
+                                stopRecording()
+                                try {
+                                    if (oldPath != null && (oldPath.contains("_incoming_") || oldPath.contains("_Call_") || oldPath.contains("_cellular_"))) {
+                                        val f = File(oldPath)
+                                        if (f.exists() && f.length() < 100_000L) {
+                                            f.delete()
+                                            Log.i(TAG, "Cleaned up premature non-voip stub: ${f.name}")
+                                        }
+                                    }
+                                } catch (ignored: Throwable) {}
+                            }
+
+                            isVoipCallActive = true
+                            currentPhoneNumber = caller
+                            currentCallType = "voip"
+                            Log.i(TAG, "VoIP call connected via MODE_IN_COMMUNICATION ($caller). Starting VoIP dual-stream recording...")
+                            if (isVoipAutoSpeakerphone) {
+                                setSpeakerphone(true)
+                            }
+                            onCallConnected(caller, "voip")
+
+                            mainHandler.removeCallbacks(voipModeCheckerRunnable)
+                            mainHandler.postDelayed(voipModeCheckerRunnable, 2500)
                         } else {
-                            // Any mode transition away from MODE_IN_COMMUNICATION indicates the VoIP call ended!
+                            // Any mode transition away from MODE_IN_COMMUNICATION
                             if (isVoipCallActive) {
-                                Log.i(TAG, "VoIP call ended (mode changed from IN_COMMUNICATION to $mode). Stopping recording!")
-                                isVoipCallActive = false
-                                mainHandler.removeCallbacks(voipModeCheckerRunnable)
-                                onCallEnded()
+                                if (!VoipNotificationListener.hasActiveVoipCall()) {
+                                    Log.i(TAG, "VoIP call ended (mode changed from IN_COMMUNICATION to $mode and notif removed). Stopping recording!")
+                                    isVoipCallActive = false
+                                    mainHandler.removeCallbacks(voipModeCheckerRunnable)
+                                    onCallEnded()
+                                } else {
+                                    Log.d(TAG, "Mode changed to $mode but VoIP notification still active. Postponing end.")
+                                }
                             }
                         }
                     }
@@ -409,6 +455,7 @@ class CallRecordService : Service() {
         isTelephonyCallActive = true
         updateNotificationText("Calling: $number")
         MainActivity.instance?.onNativeCallOutgoing(number)
+        OverlayControlChannel.notifyStateChanged()
     }
 
     fun onCallRinging(number: String, callType: String = "incoming") {
@@ -419,52 +466,94 @@ class CallRecordService : Service() {
         }
         updateNotificationText("Ringing: $number")
         MainActivity.instance?.onNativeCallRinging(number, callType)
+        OverlayControlChannel.notifyStateChanged()
     }
 
     fun onCallConnected(number: String, callType: String) {
-        currentPhoneNumber = number
-        currentCallType = callType
+        var actualCallType = callType
+        var actualNumber = number
 
-        // Safety guarantee: If a previous recording was still lingering or never closed, finalize it first!
-        if (isRecording() || currentFilePath != null) {
-            Log.w(TAG, "onCallConnected: previous session still active (${currentFilePath}). Finalizing it before starting new recording.")
-            stopRecording()
-            try { Thread.sleep(150) } catch (ignored: Throwable) {}
+        val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager
+        val isModeInComm = (audioManager?.mode == AudioManager.MODE_IN_COMMUNICATION)
+        val hasVoipNotif = VoipNotificationListener.hasActiveVoipCall()
+
+        // If callType was passed as non-voip (e.g. from Telephony offhook), but mode is IN_COMMUNICATION or VoIP notif is active:
+        // Coerce strictly to voip!
+        if (actualCallType != "voip" && (isModeInComm || hasVoipNotif || isVoipCallActive)) {
+            Log.i(TAG, "onCallConnected: received '$callType' but VoIP is active (isModeInComm=$isModeInComm, hasVoipNotif=$hasVoipNotif). Coercing to 'voip'!")
+            actualCallType = "voip"
+            val cachedName = VoipNotificationListener.getValidCallerName()
+            if (!cachedName.isNullOrBlank() && (actualNumber == "Call" || actualNumber == "Incoming Call" || actualNumber == "Outgoing Call" || actualNumber.isBlank())) {
+                actualNumber = cachedName
+            }
         }
 
-        if (callType != "voip") {
+        val isSameType = (actualCallType == "voip" && currentCallType == "voip") ||
+                         (actualCallType != "voip" && currentCallType != "voip")
+        val isSameCallSession = isSameType &&
+                recordingStartTimeMillis > 0L &&
+                (System.currentTimeMillis() - recordingStartTimeMillis < 6000L) &&
+                (currentPhoneNumber == actualNumber || currentPhoneNumber == null ||
+                 currentPhoneNumber == "Call" || currentPhoneNumber == "Incoming Call" ||
+                 currentPhoneNumber == "Outgoing Call" || actualNumber == "Call" ||
+                 currentPhoneNumber == "WhatsApp Call" || actualNumber == "WhatsApp Call")
+
+        // If this is a redundant offhook event for the EXACT SAME ongoing call session, maintain it
+        if (isRecording() && currentFilePath != null && isSameCallSession) {
+            Log.i(TAG, "onCallConnected: duplicate connection event for active call session ($currentFilePath). Maintaining active recording.")
+            if (!actualNumber.isNullOrBlank() && actualNumber != "Call" && actualNumber != "unknown" && actualNumber != currentPhoneNumber) {
+                currentPhoneNumber = actualNumber
+                updateNotificationText("Recording: $actualNumber")
+                tryRenameActiveRecordingWithContact(actualNumber)
+            }
+            MainActivity.instance?.onNativeCallStarted(currentPhoneNumber ?: actualNumber, actualCallType, currentFilePath ?: "", true)
+            OverlayControlChannel.notifyStateChanged()
+            return
+        }
+
+        // For any new or subsequent call: cleanly finalize previous recording first!
+        if (isRecording() || currentFilePath != null) {
+            Log.i(TAG, "onCallConnected: finalizing previous session ($currentFilePath) before starting new $actualCallType recording.")
+            stopRecording()
+            try { Thread.sleep(200) } catch (ignored: Throwable) {}
+        }
+
+        currentPhoneNumber = actualNumber
+        currentCallType = actualCallType
+
+        if (actualCallType != "voip") {
             isTelephonyCallActive = true
+            isVoipCallActive = false
             if (isAutoSpeakerphone) {
                 setSpeakerphone(true)
             }
         } else {
             isVoipCallActive = true
+            isTelephonyCallActive = false
             if (isVoipAutoSpeakerphone) {
                 setSpeakerphone(true)
-                // Schedule re-assertions in case WhatsApp resets the communication route upon call connect
-                for (delay in listOf(200L, 600L, 1200L, 2500L)) {
-                    mainHandler.postDelayed({
-                        if (isVoipCallActive && isVoipAutoSpeakerphone) {
-                            Log.d(TAG, "Re-asserting speakerphone for VoIP call (delay: ${delay}ms)")
-                            setSpeakerphone(true)
-                        }
-                    }, delay)
-                }
+                // Single gentle check in case WhatsApp renegotiated route on connect
+                mainHandler.postDelayed({
+                    if (isVoipCallActive && isVoipAutoSpeakerphone && !isSpeakerphoneActive()) {
+                        Log.d(TAG, "Re-asserting speakerphone for VoIP call (delay: 800ms)")
+                        setSpeakerphone(true)
+                    }
+                }, 800)
             }
         }
 
         // If user disabled autoRecord in settings and this isn't a manual trigger, skip auto recording
-        if (!isAutoRecordEnabled && callType != "manual") {
-            Log.i(TAG, "Call connected ($callType) with $number, but autoRecord is disabled in settings. Skipping auto-start.")
-            updateNotificationText("Call connected: $number")
-            MainActivity.instance?.onNativeCallStarted(number, callType, "", false)
+        if (!isAutoRecordEnabled && actualCallType != "manual") {
+            Log.i(TAG, "Call connected ($actualCallType) with $actualNumber, but autoRecord is disabled in settings. Skipping auto-start.")
+            updateNotificationText("Call connected: $actualNumber")
+            MainActivity.instance?.onNativeCallStarted(actualNumber, actualCallType, "", false)
             return
         }
 
-        val safeNumber = number.replace(Regex("[^a-zA-Z0-9+]"), "_")
+        val safeNumber = actualNumber.replace(Regex("[^a-zA-Z0-9+]"), "_")
         // For VoIP calls (WhatsApp), force WAV (raw PCM with real-time dynamic auto-gain)
         // to bypass Qualcomm AAC hardware noise gating and amplify the remote caller (+10 dB)!
-        val ext = if (callType == "voip") {
+        val ext = if (actualCallType == "voip") {
             "wav"
         } else {
             when (configuredAudioFormat.lowercase()) {
@@ -473,33 +562,80 @@ class CallRecordService : Service() {
                 else -> "m4a"
             }
         }
-        val fileName = "call_${callType}_${safeNumber}_${System.currentTimeMillis()}.$ext"
-        Log.i(TAG, "Call connected ($callType) with $number. Starting recording to: $fileName (source=$configuredAudioSource)")
-        updateNotificationText("Recording: $number")
+        val fileName = "call_${actualCallType}_${safeNumber}_${System.currentTimeMillis()}.$ext"
+        Log.i(TAG, "Call connected ($actualCallType) with $actualNumber. Starting recording to: $fileName (source=$configuredAudioSource)")
+        updateNotificationText("Recording: $actualNumber")
 
-        val started = startRecording(fileName, "$callType:$ext", configuredAudioSource)
-        MainActivity.instance?.onNativeCallStarted(number, callType, fileName, started)
+        val started = startRecording(fileName, "$actualCallType:$ext", configuredAudioSource)
+        MainActivity.instance?.onNativeCallStarted(actualNumber, actualCallType, fileName, started)
+        OverlayControlChannel.notifyStateChanged()
+    }
+
+    private fun tryRenameActiveRecordingWithContact(newContact: String) {
+        try {
+            val curPath = currentFilePath ?: return
+            val curFile = File(curPath)
+            if (curFile.exists() && (curFile.name.contains("_Call_") || curFile.name.contains("_unknown_"))) {
+                val safeContact = newContact.replace(Regex("[^a-zA-Z0-9+]"), "_")
+                val newName = curFile.name.replace("_Call_", "_${safeContact}_").replace("_unknown_", "_${safeContact}_")
+                var destFile = File(curFile.parentFile, newName)
+                if (destFile.exists() && destFile.absolutePath != curFile.absolutePath) {
+                    val ext = destFile.extension
+                    val base = destFile.nameWithoutExtension
+                    destFile = File(curFile.parentFile, "${base}_${System.currentTimeMillis()}.$ext")
+                }
+                if (curFile.renameTo(destFile)) {
+                    currentFilePath = destFile.absolutePath
+                    Log.i(TAG, "Renamed active recording file with resolved contact name: ${destFile.name}")
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Could not rename active recording: ${e.message}")
+        }
     }
 
     fun updateVoipCallerName(name: String) {
-        if (!isVoipCallActive) {
-            Log.d(TAG, "updateVoipCallerName called with '$name' but VoIP call is not active. Ignored.")
-            return
-        }
-        if (name.isBlank() || name.equals("WhatsApp", ignoreCase = true) || name.equals("WhatsApp Call", ignoreCase = true)) return
+        if (name.isBlank() || name.equals("WhatsApp", ignoreCase = true) || name.equals("Incoming call", ignoreCase = true) || name.equals("Ongoing call", ignoreCase = true)) return
+
         Log.i(TAG, "updateVoipCallerName: caller name updated to '$name'")
+        isTelephonyCallActive = false
+        isVoipCallActive = true
         currentPhoneNumber = name
         updateNotificationText("WhatsApp: $name")
+
+        // If currently recording non-voip (e.g. premature cellular recording started by Samsung Telecom),
+        // abort and immediately switch to VoIP recording!
+        if (isRecording() && currentCallType != "voip") {
+            Log.i(TAG, "updateVoipCallerName: actively recording under $currentCallType. Aborting and restarting as voip:wav for $name")
+            val oldPath = currentFilePath
+            stopRecording()
+            try {
+                if (oldPath != null && (oldPath.contains("_incoming_") || oldPath.contains("_Call_") || oldPath.contains("_cellular_"))) {
+                    val f = File(oldPath)
+                    if (f.exists() && f.length() < 100_000L) {
+                        f.delete()
+                        Log.i(TAG, "Cleaned up premature stub: ${f.name}")
+                    }
+                }
+            } catch (ignored: Throwable) {}
+            onCallConnected(name, "voip")
+            return
+        }
 
         // Rename recording file if currently recording with generic WhatsApp_Call name
         try {
             val curPath = currentFilePath
             if (curPath != null && isRecording()) {
                 val curFile = File(curPath)
-                if (curFile.exists() && curFile.name.contains("WhatsApp_Call")) {
+                if (curFile.exists() && (curFile.name.contains("WhatsApp_Call") || curFile.name.contains("_Call_"))) {
                     val safeName = name.replace(Regex("[^a-zA-Z0-9+]"), "_")
-                    val newName = curFile.name.replace("WhatsApp_Call", safeName)
-                    val newFile = File(curFile.parentFile, newName)
+                    val newName = curFile.name.replace("WhatsApp_Call", safeName).replace("_Call_", "_${safeName}_")
+                    var newFile = File(curFile.parentFile, newName)
+                    if (newFile.exists() && newFile.absolutePath != curFile.absolutePath) {
+                        val ext = newFile.extension
+                        val base = newFile.nameWithoutExtension
+                        newFile = File(curFile.parentFile, "${base}_${System.currentTimeMillis()}.$ext")
+                    }
                     if (curFile.renameTo(newFile)) {
                         currentFilePath = newFile.absolutePath
                         Log.i(TAG, "Renamed active VoIP recording file to: ${newFile.name}")
@@ -511,14 +647,19 @@ class CallRecordService : Service() {
         }
 
         MainActivity.instance?.onNativeCallStarted(name, "voip", currentFilePath ?: "", isRecording())
+        OverlayControlChannel.notifyStateChanged()
     }
 
     fun onCallEnded() {
         Log.i(TAG, "Call ended. Stopping recording.")
         val callerName = currentPhoneNumber
         VoipNotificationListener.clearCallerName()
+        if (currentCallType != "voip") {
+            lastTelephonyCallEndTime = System.currentTimeMillis()
+        }
         isTelephonyCallActive = false
         isVoipCallActive = false
+        val hadSpeaker = isSpeakerActive || isSpeakerphoneActive()
         isSpeakerActive = false
         currentPhoneNumber = null
         currentCallType = "cellular"
@@ -527,17 +668,23 @@ class CallRecordService : Service() {
         mainHandler.removeCallbacks(voipModeCheckerRunnable)
         updateNotificationText("Call monitoring active")
 
-        if (isVoipAutoSpeakerphone || isAutoSpeakerphone) {
+        if (isVoipAutoSpeakerphone || isAutoSpeakerphone || hadSpeaker) {
             setSpeakerphone(false)
         }
 
         val path = stopRecording()
+        OverlayControlChannel.notifyStateChanged()
         if (path != null && !callerName.isNullOrEmpty() && !callerName.equals("WhatsApp Call", ignoreCase = true) && path.contains("WhatsApp_Call")) {
             try {
                 val origFile = File(path)
                 val safe = callerName.replace(Regex("[^a-zA-Z0-9+]"), "_")
                 val newName = origFile.name.replace("WhatsApp_Call", safe)
-                val destFile = File(origFile.parentFile, newName)
+                var destFile = File(origFile.parentFile, newName)
+                if (destFile.exists() && destFile.absolutePath != origFile.absolutePath) {
+                    val ext = destFile.extension
+                    val base = destFile.nameWithoutExtension
+                    destFile = File(origFile.parentFile, "${base}_${System.currentTimeMillis()}.$ext")
+                }
                 if (origFile.renameTo(destFile)) {
                     Log.i(TAG, "Renamed VoIP recording with contact name: ${destFile.absolutePath}")
                     MainActivity.instance?.onNativeCallEnded(destFile.absolutePath)
@@ -586,6 +733,7 @@ class CallRecordService : Service() {
             outFile.setWritable(true, false)
 
             currentFilePath = outFile.absolutePath
+            recordingStartTimeMillis = System.currentTimeMillis()
             currentPfd = ParcelFileDescriptor.open(
                 outFile,
                 ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_READ_WRITE
@@ -598,6 +746,7 @@ class CallRecordService : Service() {
                 try { currentPfd?.close() } catch (ignored: Throwable) {}
                 currentPfd = null
                 currentFilePath = null
+                recordingStartTimeMillis = 0L
                 if (outFile.exists() && outFile.length() == 0L) {
                     outFile.delete()
                 }
@@ -607,13 +756,16 @@ class CallRecordService : Service() {
 
             Log.i(TAG, "Recording started successfully to: ${outFile.absolutePath}")
             MainActivity.instance?.onRecordingStatusChanged(true)
+            OverlayControlChannel.notifyStateChanged()
             return true
         } catch (e: Throwable) {
             Log.e(TAG, "Failed startRecording: ${e.message}", e)
             try { currentPfd?.close() } catch (ignored: Throwable) {}
             currentPfd = null
             currentFilePath = null
+            recordingStartTimeMillis = 0L
             MainActivity.instance?.onRecordingStatusChanged(false)
+            OverlayControlChannel.notifyStateChanged()
             return false
         }
     }
@@ -636,9 +788,11 @@ class CallRecordService : Service() {
         currentFilePath = null
 
         MainActivity.instance?.onRecordingStatusChanged(false)
+        OverlayControlChannel.notifyStateChanged()
 
         if (path == null) {
             Log.d(TAG, "stopRecording: no local file path was tracked, Shizuku stopped.")
+            recordingStartTimeMillis = 0L
             return null
         }
 
@@ -646,10 +800,12 @@ class CallRecordService : Service() {
             val f = File(path)
             f.setReadable(true, false)
             val fileLen = f.length()
-            Log.i(TAG, "Recording stopped. File size: $fileLen bytes ($path)")
+            val durationMs = if (recordingStartTimeMillis > 0L) (System.currentTimeMillis() - recordingStartTimeMillis) else 0L
+            Log.i(TAG, "Recording stopped. File size: $fileLen bytes, duration: ${durationMs}ms ($path)")
 
+            // Only clean up unwritten 0-byte files
             if (f.exists() && fileLen == 0L) {
-                Log.w(TAG, "Deleting 0-byte unplayable recording: $path")
+                Log.w(TAG, "Deleting 0-byte empty recording: $path")
                 try { f.delete() } catch (ignored: Throwable) {}
                 return null
             }
@@ -657,6 +813,8 @@ class CallRecordService : Service() {
         } catch (e: Throwable) {
             Log.e(TAG, "Error checking stopped file: ${e.message}")
             return null
+        } finally {
+            recordingStartTimeMillis = 0L
         }
     }
 
@@ -667,6 +825,11 @@ class CallRecordService : Service() {
             false
         }
     }
+
+    fun getCurrentPhoneNumber(): String? = currentPhoneNumber
+    fun getCurrentCallType(): String = currentCallType
+    fun getRecordingStartTime(): Long = recordingStartTimeMillis
+    fun isVoipActive(): Boolean = isVoipCallActive
 
     fun isServiceBound(): Boolean {
         return getActiveRecorderService() != null
@@ -685,6 +848,18 @@ class CallRecordService : Service() {
     }
 
     fun setSpeakerphone(on: Boolean): Boolean {
+        val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return isSpeakerActive
+        val currentSysSpeaker = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val device = audioManager.communicationDevice
+            device != null && device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn == true
+        }
+
+        if (isSpeakerActive == on && currentSysSpeaker == on) {
+            return on
+        }
         isSpeakerActive = on
 
         // 1. First trigger privileged speakerphone routing under Shizuku daemon (UID 2000)
@@ -698,7 +873,6 @@ class CallRecordService : Service() {
             Log.w(TAG, "Failed to call privileged setSpeakerphone on Shizuku daemon: ${e.message}")
         }
 
-        val audioManager = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return isSpeakerActive
         try {
             Log.i(TAG, "setSpeakerphone($on) called. Current active: ${isSpeakerphoneActive()}")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -741,6 +915,7 @@ class CallRecordService : Service() {
 
             val finalState = isSpeakerphoneActive()
             Log.i(TAG, "Speakerphone state is now: $finalState")
+            OverlayControlChannel.notifyStateChanged()
             return finalState
         } catch (e: Throwable) {
             Log.w(TAG, "Failed setSpeakerphone($on): ${e.message}")
